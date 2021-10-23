@@ -33,6 +33,103 @@ struct RcppThreadJob
     decltype(f_()) operator()() { return f_(); }
 };
 
+class LoopWorker
+{
+  public:
+    LoopWorker() {}
+    LoopWorker(ptrdiff_t begin, ptrdiff_t end, size_t id = 0)
+      : begin(begin)
+      , end(end)
+      , id(id)
+    {}
+    LoopWorker(LoopWorker&& other)
+    {
+        begin.store(other.begin.load());
+        end.store(other.end.load());
+        id = other.id;
+    }
+
+    LoopWorker(const LoopWorker& other)
+    {
+        begin.store(other.begin.load());
+        end.store(other.end.load());
+        id = other.id;
+    }
+
+    LoopWorker& operator=(const LoopWorker& other)
+    {
+        begin.store(other.begin.load());
+        end.store(other.end.load());
+        id = other.id;
+        return *this;
+    }
+
+    LoopWorker split(size_t id)
+    {
+        auto size = end - begin;
+        auto new_end = end.fetch_sub(size / 2);
+        auto new_begin = new_end - size / 2;
+        std::stringstream msg;
+        msg << "split(): "
+            << "[" << new_begin << ", " << new_end << ")\n";
+        Rcout << msg.str();
+        return LoopWorker(new_begin, new_end, id);
+    }
+
+    bool empty() const { return end - begin <= 1; }
+
+    void stealRange(std::vector<LoopWorker>& workers)
+    {
+        size_t k = 0;
+        auto nWorkers = workers.size();
+        for (size_t k = 0; k != nWorkers; k++) {
+            if (!workers[(id + k) % nWorkers].empty()) {
+                auto& other = workers[(id + k) % nWorkers];
+                auto size = other.end - other.begin;
+                if (size <= 2)
+                    continue;
+                auto newEnd = other.end.fetch_sub(size / 2);
+                end.store(newEnd);
+                begin.store(newEnd - size / 2);
+                std::stringstream msg;
+                msg << "split(): "
+                    << "[" << begin << ", " << end << " | " << newEnd + size/2 << ")\n";
+                Rcout << msg.str();
+
+                break;
+            }
+        }
+    }
+
+    static std::vector<LoopWorker> arrange(ptrdiff_t begin,
+                                           ptrdiff_t end,
+                                           size_t nWorkers)
+    {
+        auto nTasks = end - begin;
+        std::vector<LoopWorker> workers(nWorkers);
+        if (nTasks == 0)
+            return workers;
+
+        size_t minSize = nTasks / nWorkers;
+        ptrdiff_t remSize = nTasks % nWorkers;
+
+        for (size_t i = 0, k = 0; i < nTasks; k++) {
+            ptrdiff_t bBegin = begin + i;
+            ptrdiff_t bSize = minSize + (remSize-- > 0);
+            workers[k] = LoopWorker(bBegin, bBegin + bSize, k);
+            i += bSize;
+        }
+
+        return workers;
+    }
+
+    std::atomic_ptrdiff_t begin{ 0 };
+    std::atomic_ptrdiff_t end{ 0 };
+    size_t id{ 0 };
+};
+
+using LoopWorkers = std::vector<LoopWorker>;
+
 //! Implemenation of the thread pool pattern based on `Thread`.
 class ThreadPool
 {
@@ -59,7 +156,7 @@ class ThreadPool
     template<class F>
     inline void parallelFor(ptrdiff_t begin,
                             ptrdiff_t end,
-                            F&& f,
+                            F f,
                             size_t nBatches = 0);
 
     template<class F, class I>
@@ -87,6 +184,7 @@ class ThreadPool
     // variables for synchronization between workers
     size_t nWorkers_;
     std::vector<std::thread> workers_;
+    std::vector<std::shared_ptr<LoopWorkers>> loopWorkers_;
 
     alignas(64) std::atomic_size_t numJobs_{ 0 };
     std::mutex mDone_;
@@ -94,6 +192,8 @@ class ThreadPool
 
     alignas(64) std::atomic_bool stopped_{ false };
     std::exception_ptr errorPtr_{ nullptr };
+
+    std::vector<std::mutex> mDebug_{ 4 };
 };
 
 //! constructs a thread pool with as many workers as there are cores.
@@ -102,7 +202,8 @@ inline ThreadPool::ThreadPool()
 {}
 
 //! constructs a thread pool with `nWorkers` threads.
-//! @param nWorkers number of worker threads to create; if `nWorkers = 0`, all
+//! @param nWorkers number of worker threads to create; if `nWorkers = 0`,
+//! all
 //!    work pushed to the pool will be done in the main thread.
 inline ThreadPool::ThreadPool(size_t nWorkers)
   : nWorkers_(nWorkers)
@@ -127,19 +228,21 @@ inline ThreadPool::~ThreadPool() noexcept
 //! @param args a comma-seperated list of the other arguments that shall
 //!   be passed to `f`.
 //!
-//! The function returns void; if a job returns a result, use `pushReturn()`.
+//! The function returns void; if a job returns a result, use
+//! `pushReturn()`.
 template<class F, class... Args>
 void
 ThreadPool::push(F&& f, Args&&... args)
 {
     if (nWorkers_ == 0) {
-        f(args...); // if there are no workers, do the job in the main thread
+        f(args...); // if there are no workers, do the job in the main
+                    // thread
     } else {
         if (stopped_.load(std::memory_order_relaxed))
             throw std::runtime_error("cannot push to joined thread pool");
         numJobs_.fetch_add(1, std::memory_order_release);
-        auto job = std::bind(f, args...);
-        jobs_.enqueue(job);
+        jobs_.enqueue(
+          std::bind(std::forward<F>(f), std::forward<Args>(args)...));
     }
 }
 
@@ -155,7 +258,8 @@ ThreadPool::pushReturn(F&& f, Args&&... args)
   -> std::future<decltype(f(args...))>
 {
     using jobPackage = std::packaged_task<decltype(f(args...))()>;
-    auto job = std::make_shared<jobPackage>(std::bind(f, args...));
+    auto job = std::make_shared<jobPackage>(
+      std::bind(std::forward<F>(f), std::forward<Args>(args)...));
     this->push([job] { (*job)(); });
 
     return job->get_future();
@@ -170,7 +274,7 @@ template<class F, class I>
 void
 ThreadPool::map(F&& f, I&& items)
 {
-    for (auto&& item : items)
+    for (auto&& item : std::forward<I>(items))
         this->push(f, item);
 }
 
@@ -199,18 +303,42 @@ ThreadPool::map(F&& f, I&& items)
 //! the tasks need to be synchronized manually (e.g., using mutexes).
 template<class F>
 inline void
-ThreadPool::parallelFor(ptrdiff_t begin, ptrdiff_t end, F&& f, size_t nBatches)
+ThreadPool::parallelFor(ptrdiff_t begin, ptrdiff_t end, F f, size_t nBatches)
 {
     if (end < begin)
         throw std::range_error(
           "end is less than begin; cannot run backward loops.");
-    auto doBatch = [f](const Batch& b) {
-        for (ptrdiff_t i = b.begin; i < b.end; i++)
-            f(i);
+    // auto doBatch = [f](const Batch& b) {
+    //     for (ptrdiff_t i = b.begin; i < b.end; i++)
+    //         f(i);
+    // };
+    // auto batches = createBatches(begin, end - begin, nWorkers_,
+    // nBatches); for (const auto& batch : batches)
+    //     this->push(doBatch, batch);
+    auto ptr = std::shared_ptr<LoopWorkers>(new LoopWorkers(nWorkers_));
+    (*ptr.get()) = LoopWorker::arrange(begin, end, nWorkers_);
+
+    auto lev = loopWorkers_.size();
+    {
+        std::lock_guard<std::mutex> lk(mDebug_[lev]);
+        loopWorkers_.push_back(ptr);
+    }
+
+    auto runWorker = [=](size_t id) {
+        while (true) {
+            auto i = (*ptr.get())[id].begin++;
+            if (i < (*ptr.get())[id].end) {
+                // std::lock_guard<std::mutex> lk(mDebug_[lev + 1]);
+                f(i);
+            } else {
+                (*ptr.get())[id].stealRange((*ptr.get()));
+                if ((*ptr.get())[id].empty())
+                    return;
+            }
+        }
     };
-    auto batches = createBatches(begin, end - begin, nWorkers_, nBatches);
-    for (const auto& batch : batches)
-        this->push(doBatch, batch);
+    for (size_t k = 0; k != nWorkers_; k++)
+        this->push(runWorker, k);
 }
 
 //! computes a for-each loop in parallel batches.
@@ -254,17 +382,19 @@ ThreadPool::parallelForEach(I& items, F&& f, size_t nBatches)
 inline void
 ThreadPool::wait()
 {
-    while (numJobs_.load(std::memory_order_acquire) != 0) {
-        waitForEvents(); // non-spinning wait for mDone_
+    while (!this->allJobsDone()) {
+        Rcout << "";
+        waitForEvents();
         if (this->hasErrored()) {
             this->announceStop(); // stop thread pool
             continue;             // wait for currently running jobs
         }
         if (this->hasErrored() | isInterrupted())
             break;
-        Rcout << "";
         std::this_thread::yield();
     }
+
+    Rcout << "waited" << std::endl;
 
     Rcout << "";
     this->rethrowExceptions();

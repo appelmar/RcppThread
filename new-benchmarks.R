@@ -209,7 +209,7 @@ medians %>%
     labs(linetype = "", color = "") +
     scale_y_log10()  +
     theme(legend.position = "bottom")
-ggsave("benchEmpty.pdf", width = 6, height = 3)
+ggsave("benchEmpty.pdf", width = 8, height = 5)
 
 
 ## Fast iterations
@@ -319,7 +319,7 @@ medians %>%
     labs(linetype = "", color = "") +
     scale_y_log10()  +
     theme(legend.position = "bottom")
-ggsave("benchFast.pdf", width = 6, height = 3)
+ggsave("benchFast.pdf", width = 8, height = 5)
 
 ## Kernel density estimates
 
@@ -461,7 +461,7 @@ medians %>%
     labs(linetype = "", color = "") +
     xlab("sample size")  +
     theme(legend.position = "bottom")
-ggsave("benchKDE.pdf", width = 8, height = 8)
+ggsave("benchKDE.pdf", width = 8, height = 5)
 
 #
 # ## Kendall correlation matrix
@@ -606,5 +606,5 @@ ggsave("benchKDE.pdf", width = 8, height = 8)
 #     labs(linetype = "", color = "") +
 #     xlab("sample size")  +
 #     theme(legend.position = "bottom")
-# ggsave("benchKendall.pdf", width = 8, height = 8)
+# ggsave("benchKendall.pdf", width = 8, height = 5)
 
