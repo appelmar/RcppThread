@@ -37,7 +37,7 @@ class LoopWorker
 {
   public:
     LoopWorker() {}
-    LoopWorker(ptrdiff_t begin, ptrdiff_t end, size_t id = 0)
+    LoopWorker(ptrdiff_t begin, ptrdiff_t end, size_t id)
       : begin(begin)
       , end(end)
       , id(id)
@@ -64,40 +64,37 @@ class LoopWorker
         return *this;
     }
 
-    LoopWorker split(size_t id)
-    {
-        auto size = end - begin;
-        auto new_end = end.fetch_sub(size / 2);
-        auto new_begin = new_end - size / 2;
-        std::stringstream msg;
-        msg << "split(): "
-            << "[" << new_begin << ", " << new_end << ")\n";
-        Rcout << msg.str();
-        return LoopWorker(new_begin, new_end, id);
-    }
+    bool empty() const { return this->size() < 1; }
+    ptrdiff_t size() const { return end - begin; }
 
-    bool empty() const { return end - begin <= 1; }
-
-    void stealRange(std::vector<LoopWorker>& workers)
+    void stealRange(std::vector<LoopWorker>& workers, std::vector<std::mutex>& mtx)
     {
         size_t k = 0;
         auto nWorkers = workers.size();
-        for (size_t k = 0; k != nWorkers; k++) {
-            if (!workers[(id + k) % nWorkers].empty()) {
-                auto& other = workers[(id + k) % nWorkers];
-                auto size = other.end - other.begin;
-                if (size <= 2)
-                    continue;
-                auto newEnd = other.end.fetch_sub(size / 2);
-                end.store(newEnd);
-                begin.store(newEnd - size / 2);
-                std::stringstream msg;
-                msg << "split(): "
-                    << "[" << begin << ", " << end << " | " << newEnd + size/2 << ")\n";
-                Rcout << msg.str();
+        for (size_t k = 1; k < nWorkers; k++) {
+          // std::lock_guard<std::mutex> lk(mtx[(id + k) % nWorkers]);
+          auto& other = workers[(id + k) % nWorkers];
+          ptrdiff_t size = other.size();
+          if (size < 1)
+            continue;
+          // std::stringstream msg;
+          // msg << "split: "
+          //     << "[" << begin << ", " << end
+          //     << ") + [" << other.begin << ", " << other.end << ") ";
+          auto shift = (size + 1) / 2;  // shift at least by 1
+          end = other.end.load();
+          ptrdiff_t newBegin = other.begin.fetch_add(shift);
+          if (newBegin >= end)
+            continue;
 
-                break;
-            }
+          end.store(0); // don't split while changing range
+          begin.store(newBegin);
+          end.store(newBegin + shift);
+          // msg << "-> "
+          //     << "[" << newBegin << ", " << newBegin + shift
+          //     << ") + [" << other.begin << ", " << other.end << ")\n";
+          // Rcout << msg.str();
+          return;
         }
     }
 
@@ -123,9 +120,24 @@ class LoopWorker
         return workers;
     }
 
-    std::atomic_ptrdiff_t begin{ 0 };
-    std::atomic_ptrdiff_t end{ 0 };
-    size_t id{ 0 };
+    static std::vector<LoopWorker> arrange2(ptrdiff_t begin,
+                                           ptrdiff_t end,
+                                           size_t nWorkers)
+    {
+      auto workers = std::vector<LoopWorker>(nWorkers);
+      if (nWorkers == 0)
+        return workers;
+      workers[0] = LoopWorker(begin, end, 0);
+      for (size_t k = 1; k < workers.size(); k++) {
+        workers[k] = LoopWorker(end, end, k);
+      }
+
+      return workers;
+    }
+
+    alignas(64) std::atomic_ptrdiff_t begin{ 0 };
+    alignas(64) std::atomic_ptrdiff_t end{ 0 };
+    alignas(64) size_t id{ 0 };
 };
 
 using LoopWorkers = std::vector<LoopWorker>;
@@ -184,7 +196,7 @@ class ThreadPool
     // variables for synchronization between workers
     size_t nWorkers_;
     std::vector<std::thread> workers_;
-    std::vector<std::shared_ptr<LoopWorkers>> loopWorkers_;
+    std::vector<LoopWorkers> loopWorkers_;
 
     alignas(64) std::atomic_size_t numJobs_{ 0 };
     std::mutex mDone_;
@@ -194,6 +206,7 @@ class ThreadPool
     std::exception_ptr errorPtr_{ nullptr };
 
     std::vector<std::mutex> mDebug_{ 4 };
+    std::vector<std::mutex> mRange_ { 4 };
 };
 
 //! constructs a thread pool with as many workers as there are cores.
@@ -210,6 +223,7 @@ inline ThreadPool::ThreadPool(size_t nWorkers)
 {
     for (size_t w = 0; w != nWorkers_; w++)
         this->startWorker();
+  mRange_ = std::vector<std::mutex>(nWorkers_);
 }
 
 //! destructor joins all threads if possible.
@@ -315,24 +329,34 @@ ThreadPool::parallelFor(ptrdiff_t begin, ptrdiff_t end, F f, size_t nBatches)
     // auto batches = createBatches(begin, end - begin, nWorkers_,
     // nBatches); for (const auto& batch : batches)
     //     this->push(doBatch, batch);
-    auto ptr = std::shared_ptr<LoopWorkers>(new LoopWorkers(nWorkers_));
-    (*ptr.get()) = LoopWorker::arrange(begin, end, nWorkers_);
-
     auto lev = loopWorkers_.size();
     {
         std::lock_guard<std::mutex> lk(mDebug_[lev]);
-        loopWorkers_.push_back(ptr);
+        loopWorkers_.push_back(LoopWorker::arrange(begin, end, nWorkers_));
     }
+    auto& workers = loopWorkers_[lev];
 
-    auto runWorker = [=](size_t id) {
+    auto runWorker = [&](size_t id) {
         while (true) {
-            auto i = (*ptr.get())[id].begin++;
-            if (i < (*ptr.get())[id].end) {
-                // std::lock_guard<std::mutex> lk(mDebug_[lev + 1]);
-                f(i);
+          ptrdiff_t i, e;
+          {
+            std::lock_guard<std::mutex> lk(mRange_[id]);
+            i = workers[id].begin++;
+            e = workers[id].end;
+          }
+          // std::stringstream msg;
+          // msg << "worker " << id << ": "
+          //     << "[" << i << ", " << e << ")";
+            if (i < e) {
+              // std::lock_guard<std::mutex> lk(mDebug_[lev + 1]);
+              f(i);
+              // msg << " EXEC\n";
+              // Rcout << msg.str();
             } else {
-                (*ptr.get())[id].stealRange((*ptr.get()));
-                if ((*ptr.get())[id].empty())
+              // msg << " JUMP \n";
+              // Rcout << msg.str();
+                workers[id].stealRange(workers, mRange_);
+                if (workers[id].empty())
                     return;
             }
         }
@@ -394,7 +418,7 @@ ThreadPool::wait()
         std::this_thread::yield();
     }
 
-    Rcout << "waited" << std::endl;
+    // Rcout << "waited" << std::endl;
 
     Rcout << "";
     this->rethrowExceptions();

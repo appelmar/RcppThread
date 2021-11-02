@@ -44,9 +44,40 @@ inline void parallelFor(ptrdiff_t begin, ptrdiff_t size, F&& f,
                         size_t nThreads = std::thread::hardware_concurrency(),
                         size_t nBatches = 0)
 {
-    ThreadPool pool(nThreads);
-    pool.parallelFor(begin, size, f, nBatches);
-    pool.join();
+    nThreads = std::min((ptrdiff_t)nThreads, size);
+    auto workers = LoopWorker::arrange2(begin, begin + size, nThreads);
+    std::vector<std::mutex> mRange_(nThreads);
+    alignas(64) std::atomic_size_t jobsDone_{0};
+    const auto runWorker = [&](size_t id) {
+        while (true) {
+            ptrdiff_t i, e;
+            {
+                // std::lock_guard<std::mutex> lk(mRange_[id]);
+                i = workers[id].begin++;
+                e = workers[id].end;
+            }
+            std::stringstream msg;
+            // msg << "worker " << id << ": "
+            //     << "[" << i << ", " << e << ")";
+            if (i < e) {
+                f(i);
+                jobsDone_++;
+                // msg << " EXEC\n";
+                // Rcout << msg.str();
+            } else {
+                // msg << " JUMP \n";
+                // Rcout << msg.str();
+                workers[id].stealRange(workers, mRange_);
+                if (workers[id].empty())
+                    return;
+            }
+        }
+    };
+    std::vector<std::thread> threads;
+    for (int k = 0; k != nThreads && jobsDone_ != size; k++)
+        threads.push_back(std::thread(runWorker, k));
+    for (int k = 0; k != threads.size(); k++)
+        threads[k].join();
 }
 
 //! computes a range-based for loop in parallel batches.

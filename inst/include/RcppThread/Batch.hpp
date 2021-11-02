@@ -13,7 +13,7 @@
 
 namespace RcppThread {
 
-struct Batch
+struct alignas(64) Batch
 {
     ptrdiff_t begin;
     ptrdiff_t end;

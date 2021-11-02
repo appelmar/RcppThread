@@ -57,9 +57,9 @@ test_that("parallelFor works", {
     # expect_silent(testThreadPoolParallelFor())
 })
 
-test_that("nested parallelFor works", {
-    expect_silent(testThreadPoolNestedParallelFor())
-})
+# test_that("nested parallelFor works", {
+#     expect_silent(testThreadPoolNestedParallelFor())
+# })
 
 # test_that("parallelForEach works", {
 #     expect_silent(testThreadPoolParallelForEach())

@@ -138,6 +138,7 @@ Rcpp::sourceCpp(code =
 #include <RcppThread.h>
 #include <RcppParallel.h>
 
+
 // [[Rcpp::export]]
 void singleThreaded(int n)
 {
@@ -226,6 +227,37 @@ Rcpp::sourceCpp(code =
 #include <RcppThread.h>
 #include <RcppParallel.h>
 
+void myParallelFor(ptrdiff_t begin, ptrdiff_t size,
+                        std::function<void(size_t)> f,
+                        size_t nThreads = std::thread::hardware_concurrency(),
+                        size_t nBatches = 0)
+{
+    nThreads = std::min((ptrdiff_t)nThreads, size);
+    auto workers = RcppThread::LoopWorker::arrange(begin, begin + size, nThreads);
+    std::vector<std::mutex> mRange_(nThreads);
+    auto runWorker = [&](size_t id) {
+        while (true) {
+            ptrdiff_t i, e;
+            {
+                std::lock_guard<std::mutex> lk(mRange_[id]);
+                i = workers[id].begin++;
+                e = workers[id].end;
+            }
+            if (i < e) {
+                f(i);
+            } else {
+                workers[id].stealRange(workers, mRange_);
+                if (workers[id].empty())
+                    return;
+            }
+        }
+    };
+    auto threads = std::vector<std::thread>(nThreads);
+    for (int k = 0; k != nThreads; k++)
+        threads[k] = std::thread(runWorker, k);
+    for (int k = 0; k != nThreads; k++)
+        threads[k].join();
+}
 
 double op(double x) {
     double xx = x;
@@ -256,7 +288,7 @@ void ThreadPool(int n)
 void parallelFor(int n)
 {
     std::vector<double> x(100000);
-    RcppThread::parallelFor(0, n, [&] (int i) { x[i] = op(x[i]) ;});
+    myParallelFor(0, n, [&] (int i) { x[i] = op(x[i]) ;});
 }
 
 // [[Rcpp::export]]
@@ -339,6 +371,39 @@ Rcpp::sourceCpp(code =
 
 using namespace Eigen;
 
+
+void myParallelFor(ptrdiff_t begin, ptrdiff_t size,
+                        std::function<void(size_t)> f,
+                        size_t nThreads = std::thread::hardware_concurrency(),
+                        size_t nBatches = 0)
+{
+    nThreads = std::min((ptrdiff_t)nThreads, size);
+    auto workers = RcppThread::LoopWorker::arrange(begin, begin + size, nThreads);
+    std::vector<std::mutex> mRange_; //(nThreads);
+    auto runWorker = [&](size_t id) {
+        while (true) {
+            ptrdiff_t i, e;
+            {
+                // std::lock_guard<std::mutex> lk(mRange_[id]);
+                i = workers[id].begin++;
+                e = workers[id].end;
+            }
+            if (i < e) {
+                f(i);
+            } else {
+                workers[id].stealRange(workers, mRange_);
+                if (workers[id].empty())
+                    return;
+            }
+        }
+    };
+    auto threads = std::vector<std::thread>(nThreads);
+    for (int k = 0; k != nThreads; k++)
+        threads[k] = std::thread(runWorker, k);
+    for (int k = 0; k != nThreads; k++)
+        threads[k].join();
+}
+
 VectorXd kernel(const VectorXd& x)
 {
     VectorXd k(x.size());
@@ -386,9 +451,9 @@ void ThreadPool(int n, int d)
 // [[Rcpp::export]]
 void parallelFor(int n, int d)
 {
-    MatrixXd x = MatrixXd(n, d).setRandom();
+    const MatrixXd x = MatrixXd(n, d).setRandom().matrix();
     RcppThread::parallelFor(0, d, [&] (size_t i) {
-        kde(x.col(i));
+        //kde(x.col(i));
     });
 }
 

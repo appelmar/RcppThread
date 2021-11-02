@@ -8,10 +8,15 @@ Rcpp::sourceCpp(code = {
 // [[Rcpp::export]]
 void testfor()
 {
-    std::vector<int> x(1000000);
-    RcppThread::parallelFor(0, 200, [&] (int i) {
-        x[i] = i;
-    }, 12, 12);
+    std::vector<int> x(2000, 1);
+    RcppThread::parallelFor(0, x.size(), [&] (int i) {
+        x[i] = 2 * x[i];
+    });
+    for (int i = 0; i != x.size(); i++) {
+        // RcppThread::Rcout << "[" << i << "] " << x[i] << std::endl;
+         if (x[i] != 2)
+            throw std::runtime_error("mismatch");
+    }
 }
 '
 })
